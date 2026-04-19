@@ -43,11 +43,6 @@ make p6
 
 Эквивалентные команды через `docker compose exec` уже вынесены в `Makefile`.
 
-## Что сдавать
-
-- SQL-решения: `scripts/**/setup.sql` и `scripts/**/verify.sql`;
-- README по каждой SQL-практике: соответствующая папка в `scripts/`;
-- Markdown-отчеты: файлы в `theory/`.
 
 ## Примечание
 
