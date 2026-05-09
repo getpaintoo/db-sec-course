@@ -17,11 +17,13 @@
 - `theory/04_role_hierarchy_policy.md` — политика ролей для `corporate_tasks`.
 - `theory/05_privileges_report.md` — отчет по переработке привилегий.
 - `theory/06_rls_report.md` — отчет по политике RLS.
+- `theory/09_sql_injection_report.md` — отчет по анализу и исправлению SQL-инъекций.
 - `scripts/02_access_models/` — практика 2, RBAC для `task_management`.
 - `scripts/03_authentication/` — практика 3, аутентификация PostgreSQL.
 - `scripts/04_role_hierarchy/` — практика 4, иерархия ролей.
 - `scripts/05_privileges/` — практика 5, детальная настройка привилегий.
 - `scripts/06_rls/` — практика 6, RLS.
+- `scripts/09_sql_injection/` — практика 9, уязвимые запросы, безопасные исправления и проверки.
 - `scripts/common/` — общие SQL-файлы со схемой и тестовыми данными для `corporate_tasks`.
 
 ## Быстрый старт
@@ -39,6 +41,7 @@ make p3
 make p4
 make p5
 make p6
+make p9
 ```
 
 Эквивалентные команды через `docker compose exec` уже вынесены в `Makefile`.
@@ -46,4 +49,4 @@ make p6
 
 ## Примечание
 
-Внутри этой среды нет локального `psql`, поэтому запуск идет через контейнер PostgreSQL из `docker-compose.yml`. Пуш в Git не выполнялся.
+Внутри этой среды нет локального `psql`, поэтому запуск идет через контейнер PostgreSQL из `docker-compose.yml`.

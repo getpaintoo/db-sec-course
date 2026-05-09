@@ -26,3 +26,7 @@ p5:
 p6:
 	docker compose exec -T -u postgres db psql -U postgres -d postgres -f /workspace/scripts/06_rls/setup.sql
 	docker compose exec -T -u postgres db psql -U postgres -d postgres -f /workspace/scripts/06_rls/verify.sql
+
+p9:
+	docker compose exec -T -u postgres db psql -U postgres -d postgres -f /workspace/scripts/09_sql_injection/setup.sql
+	docker compose exec -T -u postgres db psql -U postgres -d postgres -f /workspace/scripts/09_sql_injection/verify.sql
