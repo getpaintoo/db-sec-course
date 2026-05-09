@@ -18,6 +18,7 @@
 - `theory/05_privileges_report.md` — отчет по переработке привилегий.
 - `theory/06_rls_report.md` — отчет по политике RLS.
 - `theory/09_sql_injection_report.md` — отчет по анализу и исправлению SQL-инъекций.
+- `theory/10_db_sec_site_security_assessment.md` — курсовой отчет по анализу защищенности учебного приложения `DB_SEC_SITE`.
 - `scripts/02_access_models/` — практика 2, RBAC для `task_management`.
 - `scripts/03_authentication/` — практика 3, аутентификация PostgreSQL.
 - `scripts/04_role_hierarchy/` — практика 4, иерархия ролей.
