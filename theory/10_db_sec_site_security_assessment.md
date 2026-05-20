@@ -1,32 +1,32 @@
-# Отчет по проверке DB_SEC_SITE через сайт
+# Отчет по проверке DB_SEC_SITE через интерфейс сайта
 
 Проверялся учебный сайт `DB_SEC_SITE`: <https://github.com/Wheatgrh/DB_SEC_SITE>.
 
-Сайт был запущен локально. Проверка делалась как у обычного пользователя: через браузер, формы, прямые ссылки и HTTP-запросы к самому сайту. Исходные файлы сайта не изменялись. В отчете ниже для каждой проблемы есть два скриншота: что вводилось и что получилось.
+Сайт был запущен локально на `http://localhost:13000`. Проверка велась как от лица обычного пользователя `alice / alice123` с ролью `student`: через страницы сайта, формы `Клиенты`, `SQL Reports`, `Профиль` и переходы по меню. Исходные файлы учебного приложения во время проверки не менялись.
 
-Основной пользователь для проверки: `alice`, роль `student`.
+Для каждого пункта ниже есть два скриншота: сначала что вводилось или менялось в браузере, затем что сайт показал после отправки. После опасных проверок данные были возвращены обратно: `alice` снова `student`, профиль `bob` восстановлен.
 
-## 1. SQL-инъекция в поиске клиентов
+## 1. Поиск клиентов возвращает все записи через SQL-инъекцию
 
-В поиске клиентов вместо обычного email был введен payload:
+В разделе `Клиенты` в поле Email был введен payload:
 
 ```sql
 ' OR true --
 ```
 
-Из-за этого сайт показал всех клиентов, включая чужие записи.
+Обычный поиск должен искать email, но из-за SQL-инъекции условие стало всегда истинным. В результате `alice` увидела всех клиентов, включая записи других владельцев.
 
-**Скрин ввода:**
+**Что вводилось:**
 
-![Ввод SQL-инъекции в поиск](../docs/assets/db_sec_site_audit/01a_catalog_sqli_input.png)
+![Ввод OR true в поиск клиентов](../docs/assets/db_sec_site_audit/01a_catalog_all_customers_input.png)
 
-**Скрин результата:**
+**Что получилось:**
 
-![Результат SQL-инъекции](../docs/assets/db_sec_site_audit/01b_catalog_sqli_result.png)
+![Поиск вернул всех клиентов](../docs/assets/db_sec_site_audit/01b_catalog_all_customers_result.png)
+
+**Риск:** любой пользователь может обойти фильтр и увидеть чужие клиентские записи.
 
 **Как исправить кодом:**
-
-Нельзя подставлять текст пользователя прямо в SQL. Нужно передавать значение параметром.
 
 ```ts
 const search = q.trim();
@@ -42,27 +42,145 @@ const result = await pool.query(
 );
 ```
 
-## 2. SQL Reports показывает все счета
+## 2. Через поиск клиентов вытаскиваются пользователи, роли и пароли
 
-В разделе SQL Reports в поле условия было введено:
+В то же поле Email был введен payload с `UNION SELECT`:
+
+```sql
+x%' UNION SELECT -3, username, password, role, id FROM training.app_users --
+```
+
+Сайт вывел данные из таблицы пользователей прямо в таблице клиентов: логины, роли и пароли `alice`, `bob`, `carol`.
+
+**Что вводилось:**
+
+![Ввод UNION SELECT для app_users](../docs/assets/db_sec_site_audit/02a_catalog_union_users_input.png)
+
+**Что получилось:**
+
+![В таблице клиентов видны логины и пароли](../docs/assets/db_sec_site_audit/02b_catalog_union_users_result.png)
+
+**Риск:** компрометация учетных записей. Если такие пароли повторяются где-то еще, атака выходит за пределы одного учебного сайта.
+
+**Как исправить кодом:**
+
+```ts
+const result = await pool.query(
+	`
+		SELECT id, full_name, email, tier, owner_user_id
+		FROM training.customers
+		WHERE email ILIKE '%' || $1 || '%'
+		ORDER BY id
+	`,
+	[search]
+);
+```
+
+Пароли также нельзя хранить открытым текстом.
+
+```ts
+import bcrypt from 'bcryptjs';
+
+const user = await pool.query(
+	'SELECT id, username, password_hash, role FROM training.app_users WHERE username = $1',
+	[username]
+);
+
+const ok = user.rows[0] && await bcrypt.compare(password, user.rows[0].password_hash);
+```
+
+## 3. Через поиск клиентов вытаскиваются счета
+
+В поле Email был введен еще один `UNION SELECT`, но уже по таблице счетов:
+
+```sql
+x%' UNION SELECT -4, i.id::text, i.amount::text, i.status, i.owner_user_id FROM training.invoices i --
+```
+
+В результате в таблице клиентов появились id счетов, суммы, статусы и владельцы.
+
+**Что вводилось:**
+
+![Ввод UNION SELECT для invoices](../docs/assets/db_sec_site_audit/03a_catalog_union_invoices_input.png)
+
+**Что получилось:**
+
+![В поиске клиентов видны счета](../docs/assets/db_sec_site_audit/03b_catalog_union_invoices_result.png)
+
+**Риск:** через одну форму можно читать данные из других таблиц, хотя интерфейс для этого вообще не предназначен.
+
+**Как исправить кодом:**
+
+Помимо параметров в SQL, приложению нужен отдельный пользователь БД с минимальными правами. Если экрану клиентов не нужны счета, у него не должно быть прямого доступа к таблице `invoices`.
+
+```sql
+REVOKE ALL ON training.invoices FROM app_user;
+REVOKE ALL ON training.app_users FROM app_user;
+
+GRANT SELECT (id, full_name, email, tier, owner_user_id)
+ON training.customers
+TO app_user;
+```
+
+## 4. Ошибка в поиске клиентов ломает страницу
+
+В поле Email был введен одинарный апостроф:
+
+```sql
+'
+```
+
+Страница не обработала ошибку нормально и вернула `500 Internal Error`.
+
+**Что вводилось:**
+
+![Ввод апострофа в поиск клиентов](../docs/assets/db_sec_site_audit/04a_catalog_sql_error_input.png)
+
+**Что получилось:**
+
+![Страница клиентов падает с 500](../docs/assets/db_sec_site_audit/04b_catalog_sql_error_result.png)
+
+**Риск:** пользователь может ломать страницу одним символом. Для атакующего это еще и сигнал, что ввод попадает в SQL небезопасно.
+
+**Как исправить кодом:**
+
+```ts
+try {
+	const result = await searchCustomers(search);
+	return { q: search, customers: result.rows };
+} catch (err) {
+	console.error('Customer search failed', err);
+	return {
+		q: search,
+		customers: [],
+		error: 'Поиск временно недоступен. Попробуйте другой запрос.'
+	};
+}
+```
+
+## 5. SQL Reports показывает все счета по условию `true`
+
+В разделе `SQL Reports` было введено:
 
 ```sql
 true
 ```
 
-Такое условие всегда истинно, поэтому сайт вывел все счета, включая чужие суммы и `card_hint`.
+Такой фильтр всегда выполняется. Сайт вывел все счета, всех владельцев и `card_hint`.
 
-**Скрин ввода:**
+**Что вводилось:**
 
-![Ввод true в SQL Reports](../docs/assets/db_sec_site_audit/02a_reports_true_input.png)
+![Ввод true в SQL Reports](../docs/assets/db_sec_site_audit/05a_reports_true_input.png)
 
-**Скрин результата:**
+**Что получилось:**
 
-![Результат true в SQL Reports](../docs/assets/db_sec_site_audit/02b_reports_true_result.png)
+![SQL Reports вернул все счета](../docs/assets/db_sec_site_audit/05b_reports_true_result.png)
+
+**Риск:** обычный студент получает отчет по всем клиентам и счетам без ограничения по своему пользователю.
 
 **Как исправить кодом:**
 
-Пользователь не должен вводить SQL. Вместо этого нужно сделать обычные фильтры и разрешить только заранее известные значения.
+Не нужно давать пользователю писать SQL. Лучше сделать обычные фильтры и собирать запрос на сервере.
 
 ```ts
 const allowedStatuses = new Set(['paid', 'pending', 'overdue', 'draft']);
@@ -73,85 +191,173 @@ if (!allowedStatuses.has(status)) {
 
 const result = await pool.query(
 	`
-		SELECT customer_name, amount, owner_name
-		FROM training.safe_invoice_report
-		WHERE status = $1
+		SELECT c.full_name, i.amount, u.full_name AS owner_name
+		FROM training.invoices i
+		JOIN training.customers c ON c.id = i.customer_id
+		JOIN training.app_users u ON u.id = i.owner_user_id
+		WHERE i.status = $1
+		  AND i.owner_user_id = $2
 	`,
-	[status]
+	[status, locals.user.id]
 );
 ```
 
-## 3. SQL Reports принимает подзапросы
+## 6. SQL Reports показывает счет администратора
 
-В поле отчета можно ввести не простой фильтр, а подзапрос:
+В поле отчета был введен фильтр по пользователю `carol`:
 
 ```sql
-i.owner_user_id = (SELECT id FROM training.app_users WHERE username = 'carol')
+u.username = 'carol'
 ```
 
-После этого обычный пользователь получает счет администратора `carol`.
+`alice` получила счет администратора `carol`, хотя это другой владелец данных.
 
-**Скрин ввода:**
+**Что вводилось:**
 
-![Ввод подзапроса в SQL Reports](../docs/assets/db_sec_site_audit/03a_reports_subquery_input.png)
+![Фильтр по carol в SQL Reports](../docs/assets/db_sec_site_audit/06a_reports_other_owner_input.png)
 
-**Скрин результата:**
+**Что получилось:**
 
-![Результат подзапроса в SQL Reports](../docs/assets/db_sec_site_audit/03b_reports_subquery_result.png)
+![SQL Reports показал счет Carol Admin](../docs/assets/db_sec_site_audit/06b_reports_other_owner_result.png)
+
+**Риск:** нарушена изоляция данных между пользователями. Любой может подобрать имя владельца и посмотреть его счета.
 
 **Как исправить кодом:**
 
-Фильтр должен собираться из белого списка полей. Например, пользователь выбирает владельца из разрешенного списка, а сервер сам добавляет условие.
+Ограничение по текущему пользователю должно добавляться сервером, а не приходить из формы.
 
 ```ts
-const filters: string[] = [];
-const values: unknown[] = [];
-
-if (ownerId) {
-	values.push(ownerId);
-	filters.push(`i.owner_user_id = $${values.length}`);
-}
-
-values.push(locals.user.id);
-filters.push(`i.owner_user_id = $${values.length}`);
-
 const result = await pool.query(
 	`
 		SELECT c.full_name, i.amount, u.full_name AS owner_name
 		FROM training.invoices i
 		JOIN training.customers c ON c.id = i.customer_id
 		JOIN training.app_users u ON u.id = i.owner_user_id
-		WHERE ${filters.join(' AND ')}
+		WHERE i.owner_user_id = $1
 	`,
-	values
+	[locals.user.id]
 );
 ```
 
-## 4. Техническая ошибка видна пользователю
+Для администраторов можно сделать отдельную ветку с явной проверкой роли.
 
-В SQL Reports можно ввести некорректное условие, например:
-
-```sql
-bad_column = 1
+```ts
+if (locals.user.role !== 'admin') {
+	filters.push(`i.owner_user_id = $${values.length + 1}`);
+	values.push(locals.user.id);
+}
 ```
 
-Сайт возвращает техническую ошибку. По таким ошибкам проще понять устройство базы и подобрать рабочую инъекцию.
+## 7. SQL Reports позволяет проверять данные из таблицы пользователей
 
-**Скрин ввода:**
+В поле отчета был введен boolean-based payload:
 
-![Ввод некорректного условия](../docs/assets/db_sec_site_audit/04a_reports_error_input.png)
+```sql
+EXISTS (SELECT 1 FROM training.app_users WHERE username = 'alice' AND password = 'alice123')
+```
 
-**Скрин результата:**
+Если условие истинно, отчет возвращает строки. Так можно проверять существование пользователей и паролей через реакцию страницы.
 
-![Техническая ошибка на странице](../docs/assets/db_sec_site_audit/04b_reports_error_result.png)
+**Что вводилось:**
+
+![Boolean payload в SQL Reports](../docs/assets/db_sec_site_audit/07a_reports_boolean_password_input.png)
+
+**Что получилось:**
+
+![Отчет подтвердил пароль через результат](../docs/assets/db_sec_site_audit/07b_reports_boolean_password_result.png)
+
+**Риск:** даже если данные не выводятся напрямую, их можно угадывать через `true/false`-условия.
 
 **Как исправить кодом:**
 
-Пользователю нужно показывать обычное сообщение, а технические детали писать только в серверный лог.
+Причина та же: пользователь не должен управлять SQL-условием. Для отчетов нужен ограниченный набор параметров.
+
+```ts
+type ReportFilter = {
+	status?: 'paid' | 'pending' | 'overdue' | 'draft';
+	minAmount?: number;
+};
+
+const values: unknown[] = [locals.user.id];
+const where = ['i.owner_user_id = $1'];
+
+if (filter.status) {
+	values.push(filter.status);
+	where.push(`i.status = $${values.length}`);
+}
+
+if (filter.minAmount) {
+	values.push(filter.minAmount);
+	where.push(`i.amount >= $${values.length}`);
+}
+```
+
+## 8. SQL Reports раскрывает `card_hint`
+
+В SQL Reports был введен фильтр:
+
+```sql
+i.status = 'draft'
+```
+
+Отчет показал черновой счет администратора и поле `card_hint = 9911`.
+
+**Что вводилось:**
+
+![Фильтр по draft в SQL Reports](../docs/assets/db_sec_site_audit/08a_reports_card_hint_input.png)
+
+**Что получилось:**
+
+![В отчете виден card_hint](../docs/assets/db_sec_site_audit/08b_reports_card_hint_result.png)
+
+**Риск:** даже короткий фрагмент платежных данных не стоит показывать всем ролям. Такие поля должны быть маскированы или доступны только ограниченному кругу.
+
+**Как исправить кодом:**
+
+```ts
+const canSeeCardHint = locals.user.role === 'admin';
+
+const result = await pool.query(
+	`
+		SELECT
+			c.full_name,
+			i.amount,
+			u.full_name AS owner_name,
+			CASE WHEN $2::boolean THEN i.card_hint ELSE '****' END AS card_hint
+		FROM training.invoices i
+		JOIN training.customers c ON c.id = i.customer_id
+		JOIN training.app_users u ON u.id = i.owner_user_id
+		WHERE i.owner_user_id = $1
+	`,
+	[locals.user.id, canSeeCardHint]
+);
+```
+
+## 9. SQL Reports раскрывает техническую ошибку PostgreSQL
+
+В поле отчета было введено несуществующее поле:
+
+```sql
+not_existing_column = 1
+```
+
+Сайт показал текст ошибки PostgreSQL: `column "not_existing_column" does not exist`.
+
+**Что вводилось:**
+
+![Некорректное поле в SQL Reports](../docs/assets/db_sec_site_audit/09a_reports_sql_error_input.png)
+
+**Что получилось:**
+
+![SQL Reports показывает текст ошибки PostgreSQL](../docs/assets/db_sec_site_audit/09b_reports_sql_error_result.png)
+
+**Риск:** подробные ошибки помогают подбирать названия таблиц, колонок и рабочие payload.
+
+**Как исправить кодом:**
 
 ```ts
 try {
-	const results = await runReport(filters);
+	const results = await runSafeReport(filter);
 	return { results };
 } catch (err) {
 	console.error('Report failed', err);
@@ -161,92 +367,117 @@ try {
 }
 ```
 
-## 5. Чужой счет открывается по прямой ссылке
+## 10. Пользователь может повысить себе роль через `roleName=admin`
 
-Пользователь `alice` открыл прямую ссылку на счет администратора `carol`.
+В обычной форме профиля поля роли нет. Через DevTools в браузере в форму был добавлен параметр:
 
-**Скрин ввода:**
+```text
+roleName=admin
+```
 
-![Запрос чужого счета](../docs/assets/db_sec_site_audit/05a_invoice_idor_input.png)
+После сохранения профиль `alice` перезагрузился уже с ролью `admin`.
 
-**Скрин результата:**
+**Что вводилось:**
 
-![Чужой счет открылся](../docs/assets/db_sec_site_audit/05b_invoice_idor_result.png)
+![В профиль добавлено поле roleName](../docs/assets/db_sec_site_audit/10a_profile_role_admin_input.png)
+
+**Что получилось:**
+
+![Alice стала admin](../docs/assets/db_sec_site_audit/10b_profile_role_admin_result.png)
+
+**Риск:** обычный пользователь может сам выдать себе административные права.
 
 **Как исправить кодом:**
 
-Перед показом счета нужно проверить владельца или роль пользователя.
+Обычный endpoint профиля должен принимать только имя и email. Роль из пользовательского запроса нужно игнорировать.
 
 ```ts
-const result = await pool.query(
-	`
-		SELECT *
-		FROM training.invoices
-		WHERE id = $1
-		  AND (
-		    owner_user_id = $2
-		    OR $3 IN ('manager', 'admin')
-		  )
-	`,
-	[invoiceId, locals.user.id, locals.user.role]
-);
+export async function POST({ locals, request }) {
+	if (!locals.user) {
+		redirect(303, '/login');
+	}
 
-if (!result.rows[0]) {
-	error(404, 'Счет не найден');
+	const form = await request.formData();
+	const fullName = String(form.get('fullName') ?? '').trim();
+	const email = String(form.get('email') ?? '').trim();
+
+	await updateUserProfile(locals.user.id, { fullName, email });
+
+	return json({ ok: true });
 }
 ```
 
-## 6. В счете показываются лишние чувствительные поля
-
-После открытия чужого счета обычному пользователю видны `card_hint` и внутренняя заметка. Даже если пользователь имеет право видеть счет, не все поля должны быть доступны всем ролям.
-
-**Скрин ввода:**
-
-![Проверка чувствительных полей](../docs/assets/db_sec_site_audit/06a_invoice_sensitive_fields_input.png)
-
-**Скрин результата:**
-
-![Чувствительные поля в счете](../docs/assets/db_sec_site_audit/06b_invoice_sensitive_fields_result.png)
-
-**Как исправить кодом:**
-
-Нужно отдавать разные наборы полей для разных ролей.
+Изменение роли нужно выносить в отдельный admin-only обработчик.
 
 ```ts
-const sql =
-	locals.user.role === 'admin'
-		? `
-			SELECT amount, status, card_hint, notes
-			FROM training.invoices
-			WHERE id = $1
-		`
-		: `
-			SELECT amount, status
-			FROM training.invoices
-			WHERE id = $1
-		`;
-
-const result = await pool.query(sql, [invoiceId]);
+if (locals.user.role !== 'admin') {
+	error(403, 'Только администратор может менять роли');
+}
 ```
 
-## 7. Журнал аудита доступен студенту
+## 11. Пользователь может изменить чужой профиль
 
-Пользователь `alice` с ролью `student` открыл раздел «Аудит» и увидел служебные события.
+Через DevTools был изменен целевой id запроса профиля: вместо своего id `alice` отправила обновление на id пользователя `bob`.
 
-**Скрин ввода:**
+В форму были подставлены новые значения:
 
-![Запрос аудита под student](../docs/assets/db_sec_site_audit/07a_audit_student_input.png)
+```text
+fullName=Bob Changed From Alice
+email=bob.changed@corp.local
+```
 
-**Скрин результата:**
+После отправки запрос был принят. Для проверки был выполнен вход под `bob`, и его профиль действительно оказался изменен.
 
-![Аудит открыт для student](../docs/assets/db_sec_site_audit/07b_audit_student_result.png)
+**Что вводилось:**
+
+![В профиле изменен target user id на Bob](../docs/assets/db_sec_site_audit/11a_profile_edit_bob_input.png)
+
+**Что получилось:**
+
+![Профиль Bob изменился](../docs/assets/db_sec_site_audit/11b_profile_edit_bob_result.png)
+
+**Риск:** это IDOR. Пользователь может менять чужие данные, если знает или угадывает id.
 
 **Как исправить кодом:**
 
-Раздел аудита должен быть доступен только администратору.
+```ts
+export async function POST({ locals, params, request }) {
+	if (!locals.user) {
+		redirect(303, '/login');
+	}
+
+	if (params.id !== locals.user.id && locals.user.role !== 'admin') {
+		error(403, 'Нельзя редактировать чужой профиль');
+	}
+
+	const form = await request.formData();
+	const fullName = String(form.get('fullName') ?? '').trim();
+	const email = String(form.get('email') ?? '').trim();
+
+	await updateUserProfile(params.id, { fullName, email });
+
+	return json({ ok: true });
+}
+```
+
+## 12. Студент может открыть журнал аудита
+
+Пользователь `alice` с ролью `student` открыл пункт меню `Аудит`.
+
+**Что делалось:**
+
+![Alice student открывает раздел Аудит](../docs/assets/db_sec_site_audit/12a_audit_student_nav_input.png)
+
+**Что получилось:**
+
+![Журнал аудита доступен student](../docs/assets/db_sec_site_audit/12b_audit_student_result.png)
+
+**Риск:** журнал содержит служебные события: неудачные входы, DDL-действия, изменения ролей. Такие данные помогают понять внутреннее устройство системы.
+
+**Как исправить кодом:**
 
 ```ts
-function requireRole(user, roles: string[]) {
+function requireRole(user: AppUser | null, roles: string[]) {
 	if (!user || !roles.includes(user.role)) {
 		error(403, 'Недостаточно прав');
 	}
@@ -254,180 +485,22 @@ function requireRole(user, roles: string[]) {
 
 export async function load({ locals }) {
 	requireRole(locals.user, ['admin']);
+
 	return {
 		events: await listAuditEvents()
 	};
 }
 ```
 
-## 8. Пользователь может повысить себе роль
-
-В обычной форме профиля поля роли нет, но в запрос можно добавить параметр:
-
-```text
-roleName=admin
-```
-
-После этого `alice` временно стала `admin`. После проверки роль была возвращена обратно.
-
-**Скрин ввода:**
-
-![Запрос на повышение роли](../docs/assets/db_sec_site_audit/08a_role_escalation_input.png)
-
-**Скрин результата:**
-
-![Роль изменилась на admin](../docs/assets/db_sec_site_audit/08b_role_escalation_result.png)
-
-**Как исправить кодом:**
-
-Обычное редактирование профиля должно менять только имя и email. Поле роли из пользовательского запроса нужно игнорировать.
-
-```ts
-await pool.query(
-	`
-		UPDATE training.app_users
-		SET full_name = $1,
-		    email = $2
-		WHERE id = $3
-	`,
-	[fullName, email, locals.user.id]
-);
-```
-
-Изменение роли лучше вынести в отдельный обработчик только для администратора.
-
-```ts
-if (locals.user?.role !== 'admin') {
-	error(403, 'Только администратор может менять роли');
-}
-
-await pool.query(
-	'UPDATE training.app_users SET role = $1 WHERE id = $2',
-	[roleName, userId]
-);
-```
-
-## 9. Пользователь может изменить чужой профиль
-
-Под пользователем `alice` был отправлен запрос на изменение данных `bob`. Сервер принял запрос. После проверки данные `bob` были восстановлены.
-
-**Скрин ввода:**
-
-![Запрос на изменение чужого профиля](../docs/assets/db_sec_site_audit/09a_edit_bob_input.png)
-
-**Скрин результата:**
-
-![Сервер принял изменение чужого профиля](../docs/assets/db_sec_site_audit/09b_edit_bob_result.png)
-
-**Как исправить кодом:**
-
-Обычный пользователь должен редактировать только свой профиль.
-
-```ts
-if (params.id !== locals.user.id && locals.user.role !== 'admin') {
-	error(403, 'Нельзя редактировать чужой профиль');
-}
-```
-
-## 10. Демо-логин и пароль видны на главной странице
-
-Главная страница без входа показывает рабочие учетные данные `alice / alice123`.
-
-**Скрин ввода:**
-
-![Открытие главной страницы без входа](../docs/assets/db_sec_site_audit/10a_demo_credentials_input.png)
-
-**Скрин результата:**
-
-![Демо-пароль виден гостю](../docs/assets/db_sec_site_audit/10b_demo_credentials_result.png)
-
-**Как исправить кодом:**
-
-Не нужно показывать пароль в интерфейсе сайта. Можно оставить только логин или вынести тестовые данные в отдельную инструкцию.
-
-```ts
-return {
-	demoUsers: [
-		{ username: 'alice' }
-	]
-};
-```
-
-## 11. Гость видит внутренние счетчики
-
-Без входа на главной странице видны внутренние счетчики: количество пользователей, клиентов, счетов и записей аудита.
-
-**Скрин ввода:**
-
-![Открытие главной страницы как гость](../docs/assets/db_sec_site_audit/11a_guest_stats_input.png)
-
-**Скрин результата:**
-
-![Внутренние счетчики видны гостю](../docs/assets/db_sec_site_audit/11b_guest_stats_result.png)
-
-**Как исправить кодом:**
-
-Такие данные лучше показывать только после входа или только администраторам.
-
-```ts
-export async function load({ locals }) {
-	if (!locals.user) {
-		return {
-			stats: null
-		};
-	}
-
-	return {
-		stats: await getDashboardStats()
-	};
-}
-```
-
-## 12. Нет ограничения попыток входа
-
-Форма входа позволяет повторять попытки. В реальной системе это облегчает подбор пароля.
-
-**Скрин ввода:**
-
-![Попытка входа с неверным паролем](../docs/assets/db_sec_site_audit/12a_login_retries_input.png)
-
-**Скрин результата:**
-
-![После повторных попыток нет блокировки](../docs/assets/db_sec_site_audit/12b_login_retries_result.png)
-
-**Как исправить кодом:**
-
-Нужно ограничить количество попыток входа хотя бы по IP и имени пользователя.
-
-```ts
-const key = `${clientIp}:${username}`;
-const attempts = loginAttempts.get(key) ?? 0;
-
-if (attempts >= 5) {
-	return fail(429, {
-		error: 'Слишком много попыток. Попробуйте позже.'
-	});
-}
-
-const session = await login(username, password);
-
-if (!session) {
-	loginAttempts.set(key, attempts + 1);
-	return fail(401, {
-		error: 'Неверный логин или пароль'
-	});
-}
-
-loginAttempts.delete(key);
-```
-
 ## Итог
 
-Сайт слишком доверяет данным от пользователя. Через формы, прямые ссылки и подставленные параметры можно получить чужие данные, открыть чужой счет, увидеть аудит и повысить себе роль.
+Главная проблема сайта не в одном конкретном поле, а в доверии к данным от пользователя. Через обычные формы удалось читать чужих клиентов, вытаскивать пользователей и пароли, смотреть счета других владельцев, раскрывать `card_hint`, повышать роль и менять чужой профиль.
 
-Главные направления исправления:
+Что нужно исправлять в первую очередь:
 
-- все SQL-запросы делать через параметры;
-- проверять права на сервере перед каждым действием;
-- не принимать роль, чужой id и SQL-условия напрямую из пользовательского запроса;
-- скрывать служебные и чувствительные данные от обычных пользователей.
+- убрать SQL, который собирается из пользовательского текста;
+- заменить свободный `SQL Reports` на безопасные фильтры;
+- проверять владельца объекта на сервере;
+- не принимать роль и чужой id из клиентского запроса;
+- скрывать технические ошибки и чувствительные поля;
+- закрыть аудит для обычных пользователей.
